@@ -1,0 +1,97 @@
+#include <Servo.h>
+
+//// --- Pins ---
+const uint8_t PIN_POT   = A0;
+const uint8_t PIN_SERVO = 9;
+
+//// --- Calibration ---
+const float POT_TRAVEL_DEG = 270.0;      // pot rotation range
+const float POT_TO_SERVO_RATIO = 5.0;    // 5° pot -> 1° servo
+const float SERVO_MIN_DEG = 0.0;
+const float SERVO_MAX_DEG = 180.0;
+const float WORKING_MAX_DEG = min(SERVO_MAX_DEG, POT_TRAVEL_DEG / POT_TO_SERVO_RATIO); // max commanded travel based on pot & servo limits
+
+const float SERVO_STEP_DEG = 1.0;
+const uint16_t STEP_DELAY_MS = 10;
+const float SERVO_DEADBAND_DEG = 0.5;   // ignore tiny changes under this threshold
+
+//// --- Gear ratio 12T:32T ---
+const float GEAR_RATIO_SERVO_TO_VALVE = 12.0 / 32.0; // = 0.375
+
+//// --- Filtering ---
+const float POT_ALPHA = 0.15f;
+
+Servo s;
+float potDegEMA = 0.0;
+float servoPosDeg = 90.0;
+unsigned long lastPrintMs = 0;
+
+bool invertDirection = false;  // toggled by serial 'd'
+
+static float mapFloat(float x, float inMin, float inMax, float outMin, float outMax) {
+  return (x - inMin) * (outMax - outMin) / (inMax - inMin) + outMin;
+}
+
+void setup() {
+  Serial.begin(115200);
+  s.attach(PIN_SERVO);
+  s.write((int)servoPosDeg);
+
+  int raw = analogRead(PIN_POT);
+  potDegEMA = mapFloat(raw, 0.0, 1023.0, 0.0, POT_TRAVEL_DEG);
+
+  Serial.println("Ready. Type 'd' to toggle direction (mirrors within working span).");
+}
+
+void loop() {
+  // --- Handle serial commands ---
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'd' || c == 'D') {
+      invertDirection = !invertDirection;
+      Serial.print("Direction toggled. invertDirection=");
+      Serial.println(invertDirection ? "true" : "false");
+    }
+  }
+
+  // --- Read pot ---
+  int raw = analogRead(PIN_POT);
+  float potDeg = mapFloat(raw, 0.0, 1023.0, 0.0, POT_TRAVEL_DEG);
+  potDegEMA = POT_ALPHA * potDeg + (1.0f - POT_ALPHA) * potDegEMA;
+
+  // --- Convert to servo target ---
+  float targetServoDeg = potDegEMA / POT_TO_SERVO_RATIO;
+  if (invertDirection) {
+    // Mirror within the usable span [SERVO_MIN_DEG, WORKING_MAX_DEG]
+    targetServoDeg = SERVO_MIN_DEG + (WORKING_MAX_DEG - (targetServoDeg - SERVO_MIN_DEG));
+  }
+
+  targetServoDeg = constrain(targetServoDeg, SERVO_MIN_DEG, WORKING_MAX_DEG);
+
+  // --- Step toward target ---
+  float delta = targetServoDeg - servoPosDeg;
+  if (fabsf(delta) >= max(SERVO_DEADBAND_DEG, SERVO_STEP_DEG)) {
+    servoPosDeg += (delta > 0 ? SERVO_STEP_DEG : -SERVO_STEP_DEG);
+    s.write((int)roundf(servoPosDeg));
+    delay(STEP_DELAY_MS);
+  } else if (fabsf(delta) > SERVO_DEADBAND_DEG) {
+    // close enough—snap to target once inside step size but outside deadband
+    servoPosDeg = targetServoDeg;
+    s.write((int)roundf(servoPosDeg));
+  }
+
+  // --- Valve angle ---
+  float valveDeg = servoPosDeg * GEAR_RATIO_SERVO_TO_VALVE;
+
+  // --- Print ---
+  unsigned long now = millis();
+  if (now - lastPrintMs >= 100) {
+    Serial.print("pot_deg=");
+    Serial.print(potDegEMA, 2);
+    Serial.print(", servo_deg=");
+    Serial.print(servoPosDeg, 2);
+    Serial.print(", valve_deg=");
+    Serial.println(valveDeg, 3);
+    lastPrintMs = now;
+  }
+}
